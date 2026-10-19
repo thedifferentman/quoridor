@@ -97,7 +97,7 @@ export function wallLocalLegal(st, player, w) {
 export const REPLAY_FORMAT = 'quoridor-replay/1';
 
 const DYNAMIC_KEYS = ['turn', 'pawns', 'walls_left', 'hands', 'l_bonus', 'phase_buff',
-  'free_buff', 'must_move', 'seq_skill_used', 'bonus_moves', 'winner', 'win_reason'];
+  'l_pending', 'free_buff', 'must_move', 'seq_skill_used', 'bonus_moves', 'winner', 'win_reason'];
 // 首步存全量（含 walls/sands），后续只存增量与变化字段（墙/流沙由事件累积重建，
 // 其余字段与上一步相同则省略，解析时合并——旧全量文件同样可读）
 const FULL_KEYS = [...DYNAMIC_KEYS, 'walls', 'sands'];
@@ -107,7 +107,7 @@ export function buildReplay(snaps, meta) {
   if (!snaps.length) return null;
   const first = snaps[0];
   const header = {
-    n: first.n, m: first.m, walls_total: first.walls_total,
+    n: first.n, m: first.m, walls_total: first.walls_total, event_limit: first.event_limit,
     deads: first.deads, goal_A: first.goal_A, goal_B: first.goal_B, skill_k: first.skill_k,
     pawns0: first.pawns, walls_left0: first.walls_left,
     hands0: first.hands, l_bonus0: first.l_bonus, meta,
@@ -115,7 +115,7 @@ export function buildReplay(snaps, meta) {
   let prev = null;
   const plies = snaps.map((s, i) => {
     const prevLen = i === 0 ? 0 : snaps[i - 1].history.length;
-    const dyn = { events: (s.history || []).slice(prevLen) };
+    const dyn = { events: (s.history || []).slice(prevLen), event_count: s.events };
     for (const k of (i === 0 ? FULL_KEYS : DYNAMIC_KEYS)) {
       if (i === 0 || k === 'turn' || k === 'pawns' || !eqJson(s[k], prev[k])) dyn[k] = s[k];
     }
@@ -134,7 +134,7 @@ export function parseReplay(j) {
   // 动态基线：首步全量，不足补头部初值；后续与上一步合并
   let base = {
     turn: 0, pawns: H.pawns0, walls_left: H.walls_left0, hands: H.hands0, l_bonus: H.l_bonus0,
-    phase_buff: [false, false], free_buff: [false, false],
+    phase_buff: [false, false], free_buff: [false, false], l_pending: [false, false], event_count: 0,
     must_move: false, seq_skill_used: false, bonus_moves: 0, winner: null, win_reason: null,
   };
   const snaps = j.plies.map((p, i) => {
@@ -153,6 +153,7 @@ export function parseReplay(j) {
       sands: [...sands], hands: base.hands, l_bonus: base.l_bonus,
       phase_buff: base.phase_buff, free_buff: base.free_buff,
       must_move: base.must_move, seq_skill_used: base.seq_skill_used,
+      events: base.event_count, event_limit: H.event_limit ?? 800, l_pending: base.l_pending,
       bonus_moves: base.bonus_moves, winner: base.winner, win_reason: base.win_reason,
       history: [...history], started: true, skills_picked: [true, true],
     };

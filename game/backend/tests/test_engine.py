@@ -330,25 +330,46 @@ def test_phase_walk_jumps_through_wall():
     assert st.pawns[0] == [4, 6] and not st.phase_buff[0]
 
 
-def test_surround_wins_for_victim():
-    st = GameState(
-        n=9, m=9, walls_total=10,
-        pawns=[[4, 4], [0, 0]], walls_left=[10, 10],
-        goal_A=[0], goal_B=[8],
-    )
-    # 用墙把先手四面包住
-    st.walls = [
-        Wall(wr=4, wc=3, orientation="H"),  # 挡北侧两格
-        Wall(wr=5, wc=3, orientation="H"),  # 挡南侧两格
-        Wall(wr=3, wc=4, orientation="V"),  # 挡西侧
-        Wall(wr=3, wc=5, orientation="V"),  # 挡东侧
-    ]
-    # 稍微调整：确保四边都被封（直接用 blocked 边构造验证即可）
-    from app.engine import check_surround_win
-    check_surround_win(st)
-    # 先手可能仍有绕行路；若真被围死则先手获胜（按规则4）
-    # 本测试仅保证函数不抛错且状态一致
-    assert st.winner in (None, 0, 1)
+@pytest.mark.parametrize("victim", [0, 1])
+@pytest.mark.parametrize("free", [False, True])
+def test_surround_is_illegal_and_unchanged(victim, free):
+    st = GameState(n=9, m=9, walls_total=10, pawns=[[0, 4], [8, 4]],
+                   walls_left=[10, 10], goal_A=[4], goal_B=[4])
+    st.pawns[victim] = [4, 4]
+    st.walls = [Wall(wr=4, wc=3, orientation="H"), Wall(wr=5, wc=3, orientation="H"),
+                Wall(wr=3, wc=4, orientation="V")]
+    st.free_buff[0] = free
+    if free:
+        st.walls_left[0] = 0
+    wall = Wall(wr=3, wc=5, orientation="V")
+    before = st.to_dict()
+    assert not is_wall_legal(st, 0, wall, free=free)[0]
+    with pytest.raises(ValueError, match="围死"):
+        apply_wall(st, wall)
+    assert st.to_dict() == before
+
+
+def test_l_wall_cannot_surround():
+    st = GameState(n=9, m=9, walls_total=10, pawns=[[3, 3], [8, 4]],
+                   walls_left=[10, 10], goal_A=[4], goal_B=[4], l_bonus=[1, 0])
+    st.walls = [Wall(wr=3, wc=2, orientation="H"), Wall(wr=2, wc=3, orientation="V")]
+    before = st.to_dict()
+    with pytest.raises(ValueError, match="围死"):
+        apply_wall(st, Wall(wr=4, wc=4, kind="L", arm="NW"))
+    assert st.to_dict() == before
+
+
+def test_phase_cannot_enter_sealed_region():
+    st = GameState(n=9, m=9, walls_total=10, pawns=[[4, 5], [8, 4]],
+                   walls_left=[10, 10], goal_A=[4], goal_B=[4], phase_buff=[True, False])
+    st.walls = [Wall(wr=4, wc=3, orientation="H"), Wall(wr=5, wc=3, orientation="H"),
+                Wall(wr=3, wc=4, orientation="V"), Wall(wr=3, wc=5, orientation="V")]
+    before = st.to_dict()
+    assert [4, 4] not in legal_pawn_moves(st, 0, ignore_walls=True)
+    with pytest.raises(ValueError):
+        apply_pawn_move(st, [4, 4])
+    assert st.to_dict() == before
+
 
 
 def test_to_dict_viewer_strips_opponent():
@@ -373,7 +394,9 @@ def test_to_ai_dict_is_slim():
     select_skills(st, 1, ["phase_walk"] * st.skill_k)
     d = st.to_ai_dict()
     assert set(d) == {"n", "m", "pawns", "turn", "walls", "walls_left", "deads", "sands",
-                      "goal_A", "goal_B", "hand", "opp_hand_count", "sand_bonus"}
+                      "goal_A", "goal_B", "hand", "opp_hand_count", "sand_bonus", "protocol_version",
+                      "events", "event_limit", "remaining_events", "remaining_moves", "skill_used", "must_move",
+                      "phase_buff", "free_buff", "l_bonus", "l_pending"}
     assert d["hand"] == {"double_move": 2} and d["opp_hand_count"] == 2
 
 

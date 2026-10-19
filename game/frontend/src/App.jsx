@@ -322,7 +322,8 @@ export default function App() {
               <span className={`turnbadge p${idc(shown.turn)}`}>
                 轮到 {seatNames[shown.turn]}（{shown.turn === 0 ? '先手' : '后手'}）
               </span>
-              {shown.bonus_moves > 0 && <span className="pill warn">流沙：同一人继续行动</span>}
+              {shown.bonus_moves > 0 && <span className="pill warn">{shown.must_move ? "连续行动：只能走子" : "流沙奖励：同一人继续行动"}</span>}
+              <span className="pill">事件 {shown.events ?? 0} / {shown.event_limit ?? 800}</span>
               {isReplay && <span className="pill">回放中 {step + 1}/{snaps.length}</span>}
               {batchView && (
                 <>

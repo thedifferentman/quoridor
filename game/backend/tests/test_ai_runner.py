@@ -82,7 +82,7 @@ def test_upload_build_move_and_match(tmp_path, monkeypatch):
     r = c.post(f"/api/games/{gid}/ai-external-move", json={"aid": aid, "timeout": 10})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["applied"] >= 1 and all(a["type"] in ("move", "wall") for a in body["actions"])
+    assert body["applied"] >= 1 and (body["action"] is None or body["action"]["type"] in ("move", "wall"))
 
     # 非法 aid 报 400
     r = c.post(f"/api/games/{gid}/ai-external-move", json={"aid": "nope"})
@@ -169,22 +169,6 @@ def test_upload_without_common_headers(tmp_path, monkeypatch):
     subprocess.run(["docker", "rmi", ai_runner.image_tag(r.json()["aid"])], capture_output=True, timeout=60)
 
 
-@needs_docker
-def test_double_requires_two_actions(tmp_path, monkeypatch):
-    """连续行动只给一步直接判负（400）。"""
-    monkeypatch.setattr(ai_runner, "AI_DIR", tmp_path)
-    c = TestClient(app)
-    src = '#include <iostream>\nint main(){std::cout << "{\\"skill\\":\\"double_move\\",\\"actions\\":[{\\"type\\":\\"move\\",\\"to\\":[1,4]}]}";}'
-    payload = make_zip({"bad.cpp": src.encode()})
-    aid = c.post("/api/ai/upload", files={"file": ("ai.zip", payload, "application/zip")}).json()["aid"]
-    g = c.post("/api/games/new", json={"n": 9, "m": 9, "seed": 7}).json()
-    gid, k = g["id"], g["state"]["skill_k"]
-    c.post(f"/api/games/{gid}/skills/select", json={"player": 0, "skills": ["double_move"] * k})
-    c.post(f"/api/games/{gid}/skills/select", json={"player": 1, "skills": ["phase_walk"] * k})
-    r = c.post(f"/api/games/{gid}/ai-external-move", json={"aid": aid, "timeout": 10})
-    assert r.status_code == 400 and "两步" in r.text, r.text
-    subprocess.run(["docker", "rmi", ai_runner.image_tag(aid)], capture_output=True, timeout=60)
-
 
 def test_map_preview_matches_new_game():
     """preview 接口地形与同参建局一致（无需 docker）。"""
@@ -241,7 +225,8 @@ def test_rebuild_batch_game_no_docker():
         "tables": [{"n": 9, "m": 9, "seed": 11,
                     "goal_A": [0, 1, 2, 3], "goal_B": [5, 6, 7, 8],
                     "skills": [["phase_walk", "phase_walk"], ["phase_walk", "phase_walk"]],
-                    "log": [{"actions": [{"type": "move", "to": mv}]}],
+                    "event_limit": 800,
+                    "log": [{"action": {"type": "move", "to": mv}}],
                     "sides": ["random", "random"]}],
     }
     try:

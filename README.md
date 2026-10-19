@@ -1,124 +1,38 @@
-## 技术栈
+# 路墙棋游戏
 
-采用 React + Python(FastAPI)。
+基于 [james1BadCreeper/quoridor](https://github.com/james1BadCreeper/quoridor) 的游戏本体修改版，采用 React + FastAPI，支持双人、人机及上传 C++ AI 对战。
 
-## 规则说明
+游戏源码位于 [`game/`](game/)。完整规则、运行方式、AI 协议及变更记录见 [游戏 README](game/README.md)。本仓库此次提交只包含游戏本体及相关文档、测试，不包含本地训练数据、模型或 MCTS 实验代码。
 
-该游戏为 Quoridor 的改版，规则变动如下：
+## 主要变更
 
-1. 地图为 $n\times m$ 随机，$n,m\in [9,15]$。双方初始时各有 $v=(n+1)\times (m+1)\times \frac 1 10$ 个墙，向下取整，均为长 $2$ 的直墙（横/竖）。
-2. 获胜点不再是对面的一行的全部点，而是由一个玩家选择两个大小为 $m/2$ 的集合 $A,B$，而另一个玩家选择先手、集合 $A$ 为获胜点或者后手、集合 $B$ 为获胜点。进行选择的玩家随机。
-3. 地图上会随机较少量的死点（不能进入）和较少量的流沙（如果进入，对方连续行动两次）。
-4. 如果成功将对方围死（让对方无论如何行动都无法获胜），那么被围死者直接获胜。
-5. 技能卡：选定获胜点、知晓地图后，双方各选 $k$ 张技能卡（$k=F(n,m)=\max(2, v//5)$，最小地图取 $2$，可重复，对方不可见，同机对战除外）。技能为：改造（打出后本次行动必须放 L 墙，否则作废）、连续行动（本回合连走两次且都必须是移动）、穿墙（下次走子无视墙）、流沙陷阱（禁获胜点）、免费墙（下次放墙不耗存量）。行动前可打出一张，不占轮次；连续行动序列中最多打出一张；使用时双方均得知。
+- 围死任意一方改为非法动作，放墙必须保留双方通路。
+- AI 改用 `protocol_version=2` 单事件协议：每次一个 `action`；连续行动分次决策，流沙单独提交。
+- 补齐技能锁、强制移动、公开技能效果和事件预算；默认上限 800 个事件。
+- 技能与动作整体校验；修复对战计数，统一实战与回放逻辑。
+- 更新 C++ 公共库及内置贪心、随机 AI，移除单 AI 容器的半核 CPU 配额。
+- 补充前端状态显示、回放字段、Windows 启动脚本和协议测试。
 
-## 游玩支持
+**旧 AI 的 `actions` 数组输出不兼容。** 请按 [AI 编写指南](game/backend/app/ai_cpp_example/README.md) 修改并重新上传。详细变更清单位于游戏 README 的“相对原始仓库的变更（2026-10-19）”一节。
 
-支持人类玩家和 AI 玩家，可以都是人或者都是 AI。
+## 本地运行
 
-支持导出 json 格式棋谱并查看回放。
+Windows 分别启动 [`game/launch_backend.bat`](game/launch_backend.bat) 和 [`game/launch_frontend.bat`](game/launch_frontend.bat)，访问 http://127.0.0.1:5173。后端 http://127.0.0.1:8000 仅提供 API。
 
-## 运行方式
+上传 AI 的编译与运行需要 Docker 和 `gcc:14-bookworm` 镜像，具体要求见游戏 README。
 
-后端：
+## 验证
 
-```bash
-pip install -r backend/requirements.txt
-uvicorn app.main:app --reload --app-dir backend
+在仓库根目录执行：
+
+```powershell
+python -m pytest game/backend/tests -q
 ```
 
-前端：
+前端构建：
 
-```bash
-npm install   # 国内网络慢可用镜像源
-npm run dev   # 访问 http://127.0.0.1:5173（/api 已代理到 8000 端口）
+```powershell
+cd game/frontend
+npm ci
+npm run build
 ```
-
-测试：`python3 -m pytest backend/tests -q`；C++ 示例见 `backend/app/ai_cpp_example/`。
-
-## 实现现状（MVP）
-
-- 后端 `backend/app/engine.py`：随机地图、直墙（长 2，改造现打现放 L 墙）、A/B 获胜列集（相互独立）、死点/流沙（首末行无死点流沙）、流沙罚步、无路径即被围判胜、技能系统（手牌/序列锁/免费墙等 5 种）。
-- 接口：开局 `/api/games/new`（支持人类指定 A/B 列集，返回 `skill_k`）、赛前选技能（`/skills/select`、AI 席位 `/skills/ai-select`）、行动前打出手牌（`/skills/play`）、走子/放墙、合法走子查询、AI 出题/选边（`/api/ai/goals`、`/api/ai/side`）、棋谱导出/导入。
-- 前端：深色现代 UI；开局向导（随机出题人 → 出题 → 选边 → 双方选技能卡，AI 出题/选边走容器）；技能面板（对战中 AI 手牌对人类隐藏）、L 墙放置与流沙选格；本地双人 / 人机混战 / AI 走到底演示、棋谱导出导入（增量回放格式，旧全快照可导入）、快照回放条。
-- AI：C++ 示例（贪心 `ai_example.cpp`、随机 `ai_random.cpp`，共用 `ai_common.hpp` 解析库并捆绑 nlohmann/json，docker 内编译）；外部 AI 上传/编译/对战接口（`POST /api/ai/upload`、`POST /api/ai/match`，沙箱 `--network none` + 超时（默认 5s）+ 内存（默认 256MiB），各 AI 接口均可带 `timeout`/`memory_mb` 覆盖）；默认 AI 列表（`GET /api/ai/list`：内置贪心/随机 + 已上传，前端开局可直选、可上传；`random` 为保留别名，指向容器随机）。
-
-## AI 编写指南
-
-本项目的最大功能是测试编写的 AI 的性能。本节指导你如何编写自己的 AI。
-
-### 1. 总览
-
-- AI 是一个程序：从 stdin 读入一个 json（当前局面），向 stdout 输出一行决策 json。
-- 语言不限（示例用 C++，可直接照抄）；源码打成 `.zip` 上传，后端在 docker 沙箱里编译、运行、对战。
-- 两阶段协议：赛前选技能卡（1 次）→ 每轮行动（多次）；出题方另有出题阶段（定 A/B 列集），另一方有选边阶段（先手+A / 后手+B）。
-- 测试方式：前端开局向导 AI 席位旁上传 zip（只需自己的源码），编译通过后自动选中，直接开局或 AI 走到底。
-
-### 2. 输入输出协议
-
-棋谱分两种：传给 AI 的是精简快照（只有当前状态，字段见 `backend/app/ai_cpp_example/README.md`）；
-`GET /api/games/{id}/export` 返回完整棋谱（带历史，仅回放/复盘用）。前端导出的回放文件为
-`quoridor-replay/1` 格式（头部静态＋每步增量事件＋变化字段差分），体积约为全快照的 1%。
-
-**阶段零：出题与选边。** 出题输入 `{"phase":"goals","n":..,"m":..,"deads":..,"sands":..}`（预览地形，与开局一致），
-输出 `{"goal_A":[...],"goal_B":[...]}`（各 m//2 列）；选边输入地图与 A/B，
-输出 `{"side":"first"}` 或 `{"side":"second"}`。向导里 AI 出题/选边走
-`POST /api/ai/goals`、`POST /api/ai/side`；`POST /api/ai/match` 用 `chooser` 指定出题方。
-
-**阶段一：赛前选技能卡。** 输入 `{"phase":"select","skill_k":k,"n":..,"m":..,"deads":..,"sands":..,"goal_A":..,"goal_B":..}`，
-输出 `{"skills":[...]}`（恰好 k 张，可重复；技能 id 见 `GET /api/skills`）。
-
-**阶段二：每轮行动。** 输入为精简快照（只有当前状态，字段见示例 README）。一次输出覆盖整轮：可选一张手牌＋1~2 个行动，输出一行 json
-（如 `{"skill":"double_move","actions":[{"type":"move","to":[1,4]},{"type":"move","to":[2,4]}]}`；
-L 墙须配改造同一次打出，否则作废；流沙陷阱须带落点 `"to"`）。
-后端按顺序落子，轮到对方或终局后剩余作废（首步踩流沙则第二步作废）；形状错误与非法行动直接判负。
-输出前调公共库 `checkDecision` 自检（旧单行动格式已废弃）。
-
-### 3. 打包规范（上传 zip）
-
-- 只收 `.cpp/.cc/.c/.h/.hpp`；最多 64 个文件、解压后 ≤8MB；须至少包含一个源文件（多文件一起编译链接，拍平为单目录，头文件用同目录 `#include`；`ai_common.hpp`/`json.hpp` 无需打包，后端自动提供）。
-- 编译出的二进制即 AI 本体：固定从 stdin/stdout 按协议交互，无参数、无网络。
-- 单步默认超时 5 秒（向导可配 1\~30 秒）、内存默认 256MiB（向导可配 64\~2048MiB）；超时/崩溃/无输出判负。
-- 开局向导的 AI 下拉 = 默认列表：内置贪心/随机（容器）+ 已上传；AI 席位旁可直接上传 zip，编译通过后自动选中。
-
-### 4. 上传与对战（后端接口）
-
-```bash
-# 上传源码 zip 并在容器内编译 → 返回 aid
-curl -F "file=@my_ai.zip" http://127.0.0.1:8000/api/ai/upload
-# 查看已上传 AI 与编译状态
-curl http://127.0.0.1:8000/api/ai/list
-# 已上传 AI 在指定对局走一步（人机对战、演示用）
-curl -X POST http://127.0.0.1:8000/api/games/{gid}/ai-external-move \
-  -H 'Content-Type: application/json' -d '{"aid":"<aid>"}'
-# 自动对战（双方各为 "random" 或 aid，直至终局/犯规/超步数）
-curl -X POST http://127.0.0.1:8000/api/ai/match \
-  -H 'Content-Type: application/json' -d '{"white":"<aid>","black":"random","seed":7}'
-# 批量对战（后台并行 N 局，seed=base+i，每局独立出题/选边/选牌；立即返回 job_id 轮询）
-# 前端顶部“批量对战”进独立面板：配对局数/并行数，实时看进度与进行中步数，完赛看胜率统计、
-# 逐局查看棋谱（预览内可返回/切换上下局）、打包下载全部棋谱 zip
-curl -X POST http://127.0.0.1:8000/api/ai/batch \
-  -H 'Content-Type: application/json' -d '{"white":"<aid>","black":"<aid>","games":20,"max_parallel":4}'
-curl http://127.0.0.1:8000/api/ai/batch/{job_id}          # 进度：完成数、进行中各局步数、已完赛结果
-curl http://127.0.0.1:8000/api/ai/batch/{job_id}/games/0  # 单局棋谱（按决策日志重放，前端可直接载入回放）
-curl -OJ http://127.0.0.1:8000/api/ai/batch/{job_id}/download  # 打包下载全部棋谱 zip
-```
-
-犯规（非法决策）、超时者判负；超出步数上限判平局（`winner=-1`）。
-
-### 5. 规则要点（AI 需注意）
-
-1. 死点不可进入；流沙进入后**对方连续行动两次**（首末行天然无死点/流沙），正常赶路应避开流沙。
-2. 墙为长 2 的直墙（横/竖）；改造现打现放 1+1 的 L 墙（不放即作废）；A、B 为相互独立的获胜列集（可相交）。
-3. 堵墙允许重叠检测（复用边即非法）；允许把路堵死，但被围者按规则 4 **直接获胜**，围墙者慎用。
-4. 到达己方获胜点立即获胜；跳子规则：相邻对方棋子时直线跳过，直线落点被挡（出界/死点/墙）则改走其两侧斜格，对方所在格不可停留。
-5. 技能：行动前可打出一张（不占轮次），连续行动序列中最多一张；“连续行动”的两步都必须是走子且一次输出，
-   对方踩流沙送的两次则可放墙；踩中流沙则剩余步数被覆盖；
-   “流沙陷阱”禁死点/已有流沙/棋子格/获胜点；使用技能双方均会得知。
-
-### 6. 基线强度
-
-- 随机示例（`ai_random.cpp`，`builtin-random`）：正规协议+本地合法性复算的随机策略，最弱对手；
-  接口与对战里的 `"random"` 为保留别名，均指向它。
-- C++ 贪心示例（`ai_example.cpp`）：BFS 最短路推进、给对方挡路的墙、四技能启发式使用；
-  实测 9×9 对容器随机六战全胜（先/后手各三局，约 20 步终结），已进默认列表（`builtin-greedy`）。

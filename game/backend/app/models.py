@@ -14,6 +14,7 @@ class WallDTO(BaseModel):
 
 
 class NewGameRequest(BaseModel):
+    event_limit: int = Field(default=800, ge=1, le=3000, description="事件上限")
     n: int | None = Field(default=None, description="行数，不填则 9~15 随机")
     m: int | None = Field(default=None, description="列数，不填则 9~15 随机")
     seed: int | None = None
@@ -54,7 +55,7 @@ class MatchRequest(BaseModel):
     n: int | None = None
     m: int | None = None
     seed: int | None = None
-    max_plies: int = Field(default=800, description="步数上限，超限判平局")
+    max_plies: int = Field(default=800, description="事件上限，超限判平局")
     timeout: float = Field(default=5, description="AI 单步运行超时（秒）")
     memory_mb: int = Field(default=256, description="容器内存（MiB）")
     chooser: str = Field(default="random", description="出题方：white/black/random（抛硬币），另一方选边")
@@ -84,7 +85,7 @@ class BatchRequest(BaseModel):
     seed: int | None = Field(default=None, description="基准种子，空则随机；第 i 局用 base+i")
     games: int = Field(default=10, description="对局数（1~1000）")
     max_parallel: int = Field(default=4, description="最大并行数（1~16）")
-    max_plies: int = Field(default=800, description="单局步数上限，超限判平局")
+    max_plies: int = Field(default=800, description="单局事件上限，超限判平局")
     timeout: float = Field(default=5, description="AI 单步运行超时（秒）")
     memory_mb: int = Field(default=256, description="容器内存（MiB）")
     chooser: str = Field(default="random", description="出题方：white/black/random（抛硬币），另一方选边")

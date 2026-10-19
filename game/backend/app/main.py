@@ -61,7 +61,7 @@ def health() -> dict:
 @app.post("/api/games/new")
 def create_game(req: NewGameRequest) -> dict:
     try:
-        st = new_game(n=req.n, m=req.m, seed=req.seed, goal_A=req.goal_A, goal_B=req.goal_B)
+        st = new_game(n=req.n, m=req.m, seed=req.seed, goal_A=req.goal_A, goal_B=req.goal_B, event_limit=req.event_limit)
     except ValueError as e:
         raise HTTPException(400, str(e))
     gid = uuid.uuid4().hex[:8]

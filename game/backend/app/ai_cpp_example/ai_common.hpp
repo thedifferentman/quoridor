@@ -39,7 +39,10 @@ struct Board {
     std::map<std::string, int> hand;      // 自家手牌 {技能id: 张数}
     int oppHandCount = 0;                 // 对方剩余手牌总数（只给张数，不给明细）
     int wallsLeft = 0, lBonus = 0;
+    int opp_walls_left = 0;              // 对方余墙，供策略与训练输入使用
     bool phased = false, freeWall = false;  // 穿墙 / 免费墙 buff
+    bool skill_used = false, must_move = false, l_pending = false;
+    int events = 0, event_limit = 800, remaining_events = 800, remaining_moves = 1;
     bool sandBonus = false;  // 流沙奖励轮：因对方踩中流沙，本轮可行动两次且可放墙
 };
 
@@ -159,7 +162,7 @@ static std::vector<std::vector<int>> bfsDist(const Board &b, int player,
     return dist;
 }
 
-// ---------------- 放墙合法性（复刻引擎 is_wall_legal；AI 应再自行保证不断路） ----------------
+// ---------------- 放墙合法性（复刻引擎 is_wall_legal） ----------------
 
 static bool wallInBounds(const Board &b, const WallSpec &w) {
     if (w.kind == "L")
@@ -217,6 +220,7 @@ static Board parseBoard(const json &j) {
     b.oppHandCount = getInt(j, "opp_hand_count", 0);
     auto wl = j.value("walls_left", json::array());
     if (wl.size() > (size_t)b.turn && wl[b.turn].is_number()) b.wallsLeft = (int)wl[b.turn];
+    if (wl.size() == 2) b.opp_walls_left = (int)wl[1 - b.turn];
     auto lb = j.value("l_bonus", json::array());
     if (lb.size() > (size_t)b.turn && lb[b.turn].is_number()) b.lBonus = (int)lb[b.turn];
     auto ph = j.value("phase_buff", json::array());
@@ -225,6 +229,14 @@ static Board parseBoard(const json &j) {
     if (fr.size() > (size_t)b.turn && fr[b.turn].is_boolean()) b.freeWall = (bool)fr[b.turn];
     if (j.contains("sand_bonus") && j["sand_bonus"].is_boolean())
         b.sandBonus = (bool)j["sand_bonus"];
+    b.skill_used = j.value("skill_used", false);
+    b.must_move = j.value("must_move", false);
+    auto pending = j.value("l_pending", json::array({false, false}));
+    b.l_pending = (bool)pending[b.turn];
+    b.events = getInt(j, "events", 0);
+    b.event_limit = getInt(j, "event_limit", 800);
+    b.remaining_events = getInt(j, "remaining_events", b.event_limit - b.events);
+    b.remaining_moves = getInt(j, "remaining_moves", 1);
     return b;
 }
 
@@ -240,10 +252,10 @@ static bool sandOk(const Board &b, Cell c) {
     if (c.first < 0 || c.first >= b.n || c.second < 0 || c.second >= b.m) return false;
     if (b.deads.count(c) || b.sands.count(c)) return false;
     if (c == b.me || c == b.opp) return false;
-    if (b.turn == 0 && c.first == b.n - 1 &&
+    if (c.first == b.n - 1 &&
         std::find(b.goalA.begin(), b.goalA.end(), c.second) != b.goalA.end())
         return false;
-    if (b.turn == 1 && c.first == 0 &&
+    if (c.first == 0 &&
         std::find(b.goalB.begin(), b.goalB.end(), c.second) != b.goalB.end())
         return false;
     return true;
@@ -260,7 +272,14 @@ static json wallJson(const WallSpec &w) {
     return o;
 }
 
-// ---------------- 整轮决策校验（与后端落子语义一致，输出前调用） ----------------
+// ---------------- 单事件决策校验（与后端落子语义一致，输出前调用） ----------------
+
+struct ActionCheck {
+    bool ok = false;
+    std::string reason;  // ok=false 时为中文原因，可直接打日志
+};
+static ActionCheck checkMove(const Board &b, Cell to);
+static ActionCheck checkWall(const Board &b, const WallSpec &w);
 
 struct DecisionCheck {
     bool ok = false;
@@ -275,7 +294,7 @@ static bool isGoal(const Board &b, int player, Cell c) {
     return c.first == 0 && std::find(b.goalB.begin(), b.goalB.end(), c.second) != b.goalB.end();
 }
 
-// 双方是否都有路（围死即终局）
+// 双方是否都有路（围死是非法动作）
 static bool bothHavePath(const Board &b) {
     auto blocked = buildBlocked(b, {}, false);
     return bfsDist(b, b.turn, blocked)[b.me.first][b.me.second] < INF &&
@@ -314,146 +333,46 @@ static bool getActionWall(const json &a, WallSpec &w) {
     return true;
 }
 
-// 校验整轮决策（输出前调用，不过直接判负——与后端落子语义逐条一致）：
-//   形状：对象，actions 为 1~2 个行动对象；
-//   技能：须在手牌（每轮都是新序列，无需查序列锁），make_sand 须带合法 to；
-//   连续行动须一次输出两步（否则判负）；
-//   首行动按打出后状态校验；若首行动终结轮次（获胜/围死/踩流沙/换人），
-//   后续 actions 作废不再校验；否则在落子后状态下继续校验第二个行动。
-//   流沙奖励轮（对方踩中流沙）的第二步可以放墙；连续行动的两步都必须是走子。
-// 注意围死墙按引擎语义合法（此处不断路强制）。
+// 校验一个事件：流沙单独提交，其他技能与一个动作共同提交。
 static DecisionCheck checkDecision(const Board &b, const json &d) {
     DecisionCheck r;
-    if (!d.is_object()) {
-        r.reason = "决策须为 json 对象";
-        return r;
+    if (!d.is_object() || d.contains("actions")) { r.reason = "须使用单事件 action 协议"; return r; }
+    Board next = b;
+    std::string skill = getStr(d, "skill", "");
+    if (d.contains("skill")) {
+        auto card = b.hand.find(skill);
+        if (b.skill_used || card == b.hand.end() || card->second <= 0) {
+            r.reason = "本序列已用技能或手牌中无此技能"; return r;
+        }
+        if (skill == "make_sand") {
+            Cell to;
+            r.ok = !d.contains("action") && getMoveTo(d, to) && sandOk(b, to);
+            if (!r.ok) r.reason = "流沙须单独提交合法 to";
+            return r;
+        }
+        if (skill == "double_move") next.must_move = true;
+        else if (skill == "phase_walk") next.phased = true;
+        else if (skill == "free_wall") next.freeWall = true;
+        else if (skill == "l_remodel") ++next.lBonus;
+        else { r.reason = "未知技能"; return r; }
     }
-    auto ait = d.find("actions");
-    if (ait == d.end() || !ait->is_array() || ait->empty() || ait->size() > 2) {
-        r.reason = "actions 须为 1~2 个行动对象";
-        return r;
-    }
-    // 技能预检（只读，不真正扣牌；每轮都是新序列）
-    Board s = b;
-    bool isDouble = false;
-    auto skillIt = d.find("skill");
-    if (skillIt != d.end()) {
-        if (!skillIt->is_string()) {
-            r.reason = "skill 须为字符串";
-            return r;
-        }
-        std::string sk = *skillIt;
-        auto hc = s.hand.find(sk);
-        if (hc == s.hand.end() || hc->second <= 0) {
-            r.reason = "手牌中无此技能:" + sk;
-            return r;
-        }
-        if (sk == "double_move") {
-            isDouble = true;
-            if (ait->size() != 2) {
-                r.reason = "连续行动须一次输出两步";
-                return r;
-            }
-        } else if (sk == "phase_walk") {
-            s.phased = true;
-        } else if (sk == "free_wall") {
-            s.freeWall = true;
-        } else if (sk == "l_remodel") {
-            s.lBonus += 1;
-        } else if (sk == "make_sand") {
-            auto toIt = d.find("to");
-            if (toIt == d.end() || !toIt->is_array() || toIt->size() != 2 ||
-                !(*toIt)[0].is_number() || !(*toIt)[1].is_number()) {
-                r.reason = "make_sand 须带 to 落点";
-                return r;
-            }
-            Cell c{(int)(*toIt)[0], (int)(*toIt)[1]};
-            if (!sandOk(b, c)) {
-                r.reason = "流沙落点非法";
-                return r;
-            }
-            s.sands.insert(c);
-        } else {
-            r.reason = "未知技能:" + sk;
-            return r;
-        }
-    }
-    // 逐个行动校验（本地仿真）；mustMove 只在连续行动仿真内有效
-    bool mustMove = isDouble;
-    for (auto &a : *ait) {
-        if (!a.is_object()) {
-            r.reason = "行动须为对象";
-            return r;
-        }
-        std::string t = getStr(a, "type", "");
-        if (t == "move") {
-            Cell to{-1, -1};
-            if (!getMoveTo(a, to)) {
-                r.reason = "走子须带 to:[r,c]";
-                return r;
-            }
-            auto legal = stepNeighbors(s, s.me, s.me, s.opp, buildBlocked(s, {}, s.phased));
-            if (std::find(legal.begin(), legal.end(), to) == legal.end()) {
-                r.reason = "非法走子";
-                return r;
-            }
-            s.me = to;
-            if (isGoal(s, s.turn, to) || s.sands.count(to)) break;  // 获胜/踩流沙：轮次终结
-        } else if (t == "wall") {
-            if (mustMove) {
-                r.reason = "连续行动中只能走子";
-                return r;
-            }
-            WallSpec w;
-            if (!getActionWall(a, w)) {
-                r.reason = "放墙须带合法 wall 对象";
-                return r;
-            }
-            // 余墙/L 券/范围/重边（围死按引擎语义合法，不断路不强制）
-            if (w.kind == "L" && s.lBonus <= 0) {
-                r.reason = "无 L 墙放置权（L 须配改造同打）";
-                return r;
-            }
-            if (!s.freeWall && s.wallsLeft <= 0) {
-                r.reason = "无剩余墙";
-                return r;
-            }
-            if (!wallInBounds(s, w)) {
-                r.reason = "墙位置越界";
-                return r;
-            }
-            std::set<std::pair<Cell, Cell>> e;
-            wallEdges(e, w.wr, w.wc, w.kind, w.ori, w.arm);
-            auto existing = buildBlocked(s, {}, false);
-            bool overlap = false;
-            for (auto &x : e)
-                if (existing.count(x)) {
-                    overlap = true;
-                    break;
-                }
-            if (overlap) {
-                r.reason = "与已有墙重叠";
-                return r;
-            }
-            s.wallSpecs.push_back(w);
-            if (w.kind == "L") s.lBonus -= 1;
-            if (s.freeWall)
-                s.freeWall = false;
-            else
-                s.wallsLeft -= 1;
-            if (!bothHavePath(s)) break;  // 围死：轮次终结（被围者胜）
-        } else {
-            r.reason = "未知行动类型";
-            return r;
-        }
-        // 本行动未终结轮次：连续行动/流沙奖励则继续校验第二个，否则换人、后续作废
-        if (!(isDouble || s.sandBonus)) break;
-    }
-    r.ok = true;
+    auto it = d.find("action");
+    if (it == d.end() || !it->is_object()) { r.reason = "须提供一个 action 对象"; return r; }
+    ActionCheck action;
+    if (getStr(*it, "type", "") == "move") {
+        Cell to;
+        if (!getMoveTo(*it, to)) { r.reason = "走子须带 to"; return r; }
+        action = checkMove(next, to);
+    } else if (getStr(*it, "type", "") == "wall") {
+        WallSpec wall;
+        if (!getActionWall(*it, wall)) { r.reason = "放墙须带 wall"; return r; }
+        action = checkWall(next, wall);
+    } else { r.reason = "未知行动类型"; return r; }
+    r.ok = action.ok; r.reason = action.reason;
     return r;
 }
 
-// 组装整轮输出：技能（可空）+ 1~2 个行动，避免手写多层括号出错
+// 组装一个事件；流沙的 action 使用 null，输出时省略。
 static json moveAct(int r, int c) {
     json o = json::object();
     o["type"] = "move";
@@ -466,31 +385,25 @@ static json wallAct(const json &w) {
     o["wall"] = w;
     return o;
 }
-static json decision(const std::string &skill, const json &skillTo, const std::vector<json> &acts) {
+static json decision(const std::string &skill, const json &skillTo, const json &action = nullptr) {
     json out = json::object();
     if (!skill.empty()) out["skill"] = skill;
     if (!skillTo.is_null()) out["to"] = skillTo;
-    out["actions"] = json::array();
-    for (auto &a : acts) out["actions"].push_back(a);
+    if (!action.is_null()) out["action"] = action;
     return out;
 }
 
 // 带自检的输出：校验不过则退化为首个合法走子（无路时原样输出，实战中对局已结束）
 static json checked(const Board &b, const json &out, const std::vector<Cell> &legal) {
     if (checkDecision(b, out).ok) return out;
-    if (!legal.empty()) {
-        Cell s = legal[0];
-        return decision("", json(nullptr), {moveAct(s.first, s.second)});
-    }
+    for (Cell s : legal)
+        if (checkMove(b, s).ok) return decision("", json(nullptr), moveAct(s.first, s.second));
     return out;
 }
 
 // ---------------- 动作合法性总检（复刻引擎 apply_* 校验） ----------------
 
-struct ActionCheck {
-    bool ok = false;
-    std::string reason;  // ok=false 时为中文原因，可直接打日志
-};
+
 
 // 走子是否合法：在合法走子集内（含跳子；穿墙 buff 下按无视墙视角）。
 static ActionCheck checkMove(const Board &b, Cell to) {
@@ -500,6 +413,8 @@ static ActionCheck checkMove(const Board &b, Cell to) {
         r.reason = "非法走子（不在合法走子集内：可能撞墙/进死点/停留对方格）";
         return r;
     }
+    auto probe = b; probe.me = to;
+    if (!bothHavePath(probe)) { r.reason = "走子后无路通往目标"; return r; }
     r.ok = true;
     return r;
 }
@@ -507,11 +422,10 @@ static ActionCheck checkMove(const Board &b, Cell to) {
 // 放墙是否合法：余墙（免费墙除外）、范围内、不与已有墙重边。
 // L 墙现打现放：lBonus 只在打出改造后的本次行动内有效，裸 L 输出一律非法；
 // 配技能校验时把待放状态的 lBonus 置 1 再调本函数。
-// forbidSurround=true 时还要求放墙后双方仍有路：
-//   引擎本身允许围死（被围者按规则 4 直接获胜），所以该检查只是 AI 自保；
-//   若“执意”围死（如算清对方被围后自己仍能赢），传 false 跳过此项即可。
-static ActionCheck checkWall(const Board &b, const WallSpec &w, bool forbidSurround = true) {
+// 放墙后必须保留双方通路，不提供跳过连通性检查的选项。
+static ActionCheck checkWall(const Board &b, const WallSpec &w) {
     ActionCheck r;
+    if (b.must_move) { r.reason = "连续行动中只能走子"; return r; }
     if (w.kind == "L" && b.lBonus <= 0) {
         r.reason = "无 L 墙放置权（需先打出改造技能）";
         return r;
@@ -536,14 +450,14 @@ static ActionCheck checkWall(const Board &b, const WallSpec &w, bool forbidSurro
             r.reason = "与已有墙重叠（复用边）";
             return r;
         }
-    if (forbidSurround) {
+    {
         auto nb = buildBlocked(b, {w}, false);
         if (bfsDist(b, b.turn, nb)[b.me.first][b.me.second] >= INF) {
-            r.reason = "放墙后己方无路（会被围死而对方直接获胜）";
+            r.reason = "放墙后己方无路，围死犯规";
             return r;
         }
         if (bfsDist(b, 1 - b.turn, nb)[b.opp.first][b.opp.second] >= INF) {
-            r.reason = "放墙后对方无路（对方被围死将直接获胜；执意围死可关掉 forbidSurround）";
+            r.reason = "放墙后对方无路，围死犯规";
             return r;
         }
     }

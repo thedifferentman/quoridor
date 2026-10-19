@@ -1,4 +1,4 @@
-// 随机 AI（C++）：与贪心示例走同一套正规编写手段（ai_common.hpp 解析 + 两阶段协议）。
+// 随机 AI（C++）：与贪心示例共用 ai_common.hpp 和单事件协议。
 // 策略：选牌全随机；行动 25% 随机放墙、75% 随机走子，偶尔随机打出手牌。
 // 所有输出均经本地合法性复算，保证落子必合法（避免被判负）。
 //
@@ -27,7 +27,7 @@ static std::vector<WallSpec> legalWallCands(const Board &b, bool allowL, int lBo
     }
     for (auto &w : cands) {
         if (w.kind == "L" && !allowL) continue;
-        if (!checkWall(bb, w, true).ok) continue;
+        if (!checkWall(bb, w).ok) continue;
         out.push_back(w);
     }
     return out;
@@ -81,18 +81,20 @@ int main() {
         return 0;
     }
 
-    // ===== 阶段二：行动（一次输出覆盖整轮） =====
+    // ===== 阶段二：行动（每次一个事件） =====
     Board b = parseBoard(j);
     auto legal0 = stepNeighbors(b, b.me, b.me, b.opp, buildBlocked(b, {}, b.phased));
     auto pickFrom = [&](const Board &bb, bool phased) {
         auto legal = stepNeighbors(bb, bb.me, bb.me, bb.opp, buildBlocked(bb, {}, phased));
+        Board probe = bb; probe.phased = phased;
+        legal.erase(std::remove_if(legal.begin(), legal.end(), [&](Cell to) { return !checkMove(probe, to).ok; }), legal.end());
         if (legal.empty()) return Cell{-1, -1};
         return legal[rng()() % legal.size()];
     };
     auto pickMove = [&](bool phased) { return pickFrom(b, phased); };
 
     // 20% 随机打出一张手牌
-    if (!b.hand.empty() && rng()() % 100 < 20) {
+    if (!b.skill_used && !b.hand.empty() && rng()() % 100 < 20) {
         std::vector<std::string> owned;
         for (auto &[id, cnt] : b.hand)
             if (cnt > 0) owned.push_back(id);
@@ -102,14 +104,7 @@ int main() {
                 bool ph = (sk == "phase_walk") || b.phased;
                 Cell s1 = pickMove(ph);
                 if (s1.first >= 0) {
-                    // 连续行动一次走两步（第二步落流沙则后端自动作废，无需担心）
-                    Board b2 = b;
-                    b2.me = s1;
-                    b2.phased = ph;
-                    Cell s2 = pickFrom(b2, ph);
-                    if (s2.first < 0) s2 = s1;
-                    json out = decision(sk, json(nullptr),
-                                        {moveAct(s1.first, s1.second), moveAct(s2.first, s2.second)});
+                    json out = decision(sk, nullptr, moveAct(s1.first, s1.second));
                     std::cout << checked(b, out, legal0).dump();
                     return 0;
                 }
@@ -117,24 +112,23 @@ int main() {
                 for (int t = 0; t < 100; ++t) {
                     Cell c{(int)(rng()() % b.n), (int)(rng()() % b.m)};
                     if (!sandOk(b, c)) continue;
-                    Cell s = pickMove(b.phased);
-                    if (s.first < 0) break;
                     json to = json::array({c.first, c.second});
-                    json out = decision(sk, to, {moveAct(s.first, s.second)});
+                    json out = decision(sk, to);
                     std::cout << checked(b, out, legal0).dump();
                     return 0;
                 }
             } else if ((sk == "free_wall" || sk == "l_remodel") &&
-                       (b.wallsLeft > 0 || b.freeWall)) {
+                       !b.must_move && (b.wallsLeft > 0 || b.freeWall || sk == "free_wall")) {
                 bool allowL = sk == "l_remodel" || b.lBonus > 0;
-                auto cands = legalWallCands(b, allowL, sk == "l_remodel" ? 1 : -1);
+                Board pending = b; pending.freeWall = b.freeWall || sk == "free_wall";
+                auto cands = legalWallCands(pending, allowL, sk == "l_remodel" ? 1 : -1);
                 // l_remodel 现打现放：只选 L 墙；free_wall：只选直墙
                 std::vector<WallSpec> fit;
                 for (auto &w : cands)
                     if ((sk == "l_remodel") == (w.kind == std::string("L"))) fit.push_back(w);
                 if (!fit.empty()) {
                     json out = decision(sk, json(nullptr),
-                                        {wallAct(wallJson(fit[rng()() % fit.size()]))});
+                                        wallAct(wallJson(fit[rng()() % fit.size()])));
                     std::cout << checked(b, out, legal0).dump();
                     return 0;
                 }
@@ -144,26 +138,21 @@ int main() {
     }
 
     // 25% 随机放墙（有存量或免费墙时），否则随机走子
-    if ((b.wallsLeft > 0 || b.freeWall) && rng()() % 100 < 25) {
+    if (!b.must_move && (b.wallsLeft > 0 || b.freeWall) && rng()() % 100 < 25) {
         auto cands = legalWallCands(b, b.lBonus > 0);
         std::vector<WallSpec> straights;
         for (auto &w : cands)
             if (w.kind == "straight") straights.push_back(w);
         if (!straights.empty()) {
             const WallSpec &w = straights[rng()() % straights.size()];
-            if (b.freeWall && b.hand.count("free_wall") && b.hand["free_wall"] > 0) {
-                json out = decision("free_wall", json(nullptr), {wallAct(wallJson(w))});
-                std::cout << checked(b, out, legal0).dump();
-                return 0;
-            }
-            json out = decision("", json(nullptr), {wallAct(wallJson(w))});
+            json out = decision("", json(nullptr), wallAct(wallJson(w)));
             std::cout << checked(b, out, legal0).dump();
             return 0;
         }
     }
     Cell s = pickMove(b.phased);
     if (s.first < 0) s = b.me;
-    json out = decision("", json(nullptr), {moveAct(s.first, s.second)});
+    json out = decision("", json(nullptr), moveAct(s.first, s.second));
     std::cout << checked(b, out, legal0).dump();
     return 0;
 }

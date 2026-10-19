@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 # 类型别名
@@ -85,6 +86,8 @@ class GameState:
     winner: int | None = None
     win_reason: str | None = None
     history: list[dict] = field(default_factory=list)
+    events: int = 0  # 已完成的事件：移动、放墙或单独放置流沙
+    event_limit: int = 800
     # —— 技能系统 ——
     skill_k: int = 0  # 每人赛前选取的技能卡数 F(n,m)
     hands: list[dict] = field(default_factory=lambda: [{}, {}])  # 每人手牌 {技能id: 张数}
@@ -122,6 +125,8 @@ class GameState:
             "goal_B": self.goal_B,
             "turn": self.turn,
             "bonus_moves": self.bonus_moves,
+            "events": self.events,
+            "event_limit": self.event_limit,
             "winner": self.winner,
             "win_reason": self.win_reason,
             "history": [dict(h) for h in history],
@@ -138,19 +143,7 @@ class GameState:
         }
 
     def to_ai_dict(self) -> dict:
-        """传给 AI 的精简快照：只有当前棋盘状态，无历史操作。
-
-        与导出棋谱格式不通用：此处只给决策必需项。
-        含：尺寸、双方棋子、轮次、墙（位置/余量）、死点/流沙、获胜列、
-        自家手牌明细、对方手牌总数、流沙奖励轮。
-        不含：history（技能打出无后效，复盘才用）、胜负/开局标记（调用时恒定）、
-        skill_k/walls_total（由 n、m 推导）、穿墙/免费墙 buff
-        （技能与行动原子打出，不会残留到下次决策）、L 券
-        （改造现打现放：打出后本次行动必须放 L 墙，否则作废，无需传入）。
-        回合状态只用一个字段：sand_bonus 为真＝因对方踩中流沙，本轮可行动两次
-        （与连续行动不同，此时放墙不受限）；连续行动须一次输出两步，
-        must_move/seq_skill_used/bonus_moves 只在引擎内部流转，不传给 AI。
-        """
+        """单事件协议快照；提供完整公开状态，仍隐藏对方手牌种类。"""
         me, opp = self.turn, 1 - self.turn
         return {
             "n": self.n,
@@ -163,6 +156,17 @@ class GameState:
             "sands": sorted(self.sands),
             "goal_A": self.goal_A,
             "goal_B": self.goal_B,
+            "protocol_version": 2,
+            "events": self.events,
+            "event_limit": self.event_limit,
+            "remaining_events": self.event_limit - self.events,
+            "remaining_moves": self.bonus_moves + 1,
+            "skill_used": self.seq_skill_used,
+            "must_move": self.must_move,
+            "phase_buff": list(self.phase_buff),
+            "free_buff": list(self.free_buff),
+            "l_bonus": list(self.l_bonus),
+            "l_pending": list(self.l_pending),
             "hand": dict(self.hands[me]),
             "opp_hand_count": sum(self.hands[opp].values()),
             "sand_bonus": self.bonus_moves > 0 and not self.must_move,
@@ -183,6 +187,8 @@ class GameState:
             goal_B=list(d.get("goal_B", [])),
             turn=d.get("turn", 0),
             bonus_moves=d.get("bonus_moves", 0),
+            events=d.get("events", 0),
+            event_limit=d.get("event_limit", 800),
             winner=d.get("winner"),
             win_reason=d.get("win_reason"),
             history=list(d.get("history", [])),
@@ -221,7 +227,7 @@ def pick_goal_sets(m: int, rng: random.Random) -> tuple[list[int], list[int]]:
 
 
 def _has_path(state: GameState, player: int) -> bool:
-    """BFS 判断 player 是否有步行路径到达目标（忽略剩余墙数）。"""
+    """只按墙和死点判断通路，不把棋子占位或一次性穿墙当作永久障碍或通路。"""
     from collections import deque
 
     blocked = build_blocked_edges(state)
@@ -235,12 +241,15 @@ def _has_path(state: GameState, player: int) -> bool:
         goals = {(0, c) for c in state.goal_B}
     if (sr, sc) in goals:
         return True
-    opp = state.pawns[1 - player]
     seen = {(sr, sc)}
     dq = deque([(sr, sc)])
     while dq:
         r, c = dq.popleft()
-        for nr, nc in _step_neighbors(state, r, c, player, blocked):
+        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if not (0 <= nr < state.n and 0 <= nc < state.m) or (nr, nc) in state.deads:
+                continue
+            if (r, c, nr, nc) in blocked:
+                continue
             if (nr, nc) in seen:
                 continue
             if (nr, nc) in goals:
@@ -329,8 +338,11 @@ def new_game(
     sand_ratio: float = 0.04,
     goal_A: list[int] | None = None,
     goal_B: list[int] | None = None,
+    event_limit: int = 800,
 ) -> GameState:
     """随机开局：n,m∈[9,15]，死点/流沙各约 4%，保连通；A/B 可手动指定或随机。"""
+    if not 1 <= event_limit <= 3000:
+        raise ValueError("event_limit 须在 [1,3000] 内")
     rng = random.Random(seed)
     n = n or rng.randint(9, 15)
     m = m or rng.randint(9, 15)
@@ -369,7 +381,7 @@ def new_game(
         rest = [x for x in candidates if x not in deads]
         sands = set(rest[:n_sand])
         st = GameState(
-            n=n, m=m, walls_total=v,
+            n=n, m=m, walls_total=v, event_limit=event_limit,
             pawns=[list(start0), list(start1)],
             walls_left=[v, v],
             deads=deads, sands=sands,
@@ -381,7 +393,7 @@ def new_game(
             return st
     # 兜底：无特殊格
     return GameState(
-        n=n, m=m, walls_total=v,
+        n=n, m=m, walls_total=v, event_limit=event_limit,
         pawns=[list(start0), list(start1)],
         walls_left=[v, v],
         goal_A=goal_A, goal_B=goal_B,
@@ -442,7 +454,11 @@ def legal_pawn_moves(state: GameState, player: int, ignore_walls: bool = False) 
     """合法走子：正交一步 + 跳子（穿墙 buff 下无视墙，仍不能进死点/对方格）。"""
     blocked = set() if ignore_walls else build_blocked_edges(state)
     r, c = state.pawns[player]
-    return _step_neighbors(state, r, c, player, blocked)
+    moves = _step_neighbors(state, r, c, player, blocked)
+    if ignore_walls:
+        # 穿墙不能把自己送进不通往目标的封闭区域。
+        moves = [to for to in moves if _has_path(replace(state, pawns=[to if p == player else pos for p, pos in enumerate(state.pawns)]), player)]
+    return moves
 
 
 def _wall_in_bounds(state: GameState, w: Wall) -> bool:
@@ -457,7 +473,7 @@ def _wall_in_bounds(state: GameState, w: Wall) -> bool:
 
 
 def is_wall_legal(state: GameState, player: int, w: Wall, free: bool = False) -> tuple[bool, str]:
-    """放墙合法性：有余墙（免费墙除外）、L 放置权、范围内、不与已有墙重边。"""
+    """检查墙资源、几何位置，以及放置后双方均保留通往目标的路径。"""
     if w.kind == "L" and state.l_bonus[player] <= 0:
         return False, "无 L 墙放置权（需先打出改造技能）"
     if not free and state.walls_left[player] <= 0:
@@ -472,6 +488,9 @@ def is_wall_legal(state: GameState, player: int, w: Wall, free: bool = False) ->
         existing |= wall_edges(old)
     if edges & existing:
         return False, "与已有墙重叠"
+    probe = replace(state, walls=state.walls + [w])
+    if not _has_path(probe, 0) or not _has_path(probe, 1):
+        return False, "不能围死任意一方，双方必须保留通往目标的路径"
     return True, ""
 
 
@@ -494,8 +513,17 @@ def _settle_l_pending(state: GameState, player: int, placed_l: bool) -> None:
         state.l_bonus[player] = max(0, state.l_bonus[player] - 1)
 
 
+def _finish_event(state: GameState) -> GameState:
+    """每个成功事件只计一次；最后一个事件到达目标时，获胜优先于超限。"""
+    state.events += 1
+    if state.winner is None and state.events >= state.event_limit:
+        state.winner = -1
+        state.win_reason = f"达到事件上限（{state.event_limit}），判平局"
+    return state
+
+
 def apply_pawn_move(state: GameState, to: list[int] | tuple[int, int]) -> GameState:
-    """走子：合法则移动，踩流沙对方连走两次；到达目标则获胜；否则判围死。"""
+    """合法走子，踩流沙对方连走两次，到达目标获胜。"""
     if state.winner is not None:
         raise ValueError("对局已结束")
     if not state.started:
@@ -510,15 +538,15 @@ def apply_pawn_move(state: GameState, to: list[int] | tuple[int, int]) -> GameSt
     _settle_l_pending(state, player, placed_l=False)  # 走子则改造待放置作废
     state.history.append({"player": player, "type": "move", "to": [tr, tc]})
 
-    # 到达目标直接获胜（先于围死判定）
+    # 到达目标直接获胜。
     if player == 0 and (tr, tc - 0) == (state.n - 1, tc) and tc in state.goal_A:
         state.winner = player
         state.win_reason = "到达获胜点"
-        return state
+        return _finish_event(state)
     if player == 1 and (tr == 0) and tc in state.goal_B:
         state.winner = player
         state.win_reason = "到达获胜点"
-        return state
+        return _finish_event(state)
 
     # 流沙：对方连续行动两次；若本方处于连续行动（S2）中，剩余步数被流沙覆盖
     if (tr, tc) in state.sands:
@@ -530,13 +558,11 @@ def apply_pawn_move(state: GameState, to: list[int] | tuple[int, int]) -> GameSt
     else:
         _advance_turn(state)
 
-    # 围死判定：无路径者直接获胜（规则 4）
-    check_surround_win(state)
-    return state
+    return _finish_event(state)
 
 
 def apply_wall(state: GameState, w: Wall) -> GameState:
-    """放墙：允许堵死路径，但堵死后被围者按规则 4 直接获胜。"""
+    """放墙前检查双方通路；非法墙不消耗资源、不推进回合。"""
     if state.winner is not None:
         raise ValueError("对局已结束")
     if not state.started:
@@ -558,27 +584,7 @@ def apply_wall(state: GameState, w: Wall) -> GameState:
         state.walls_left[player] -= 1
     state.history.append({"player": player, "type": "wall", "wall": w.to_dict()})
     _advance_turn(state)
-    check_surround_win(state)
-    return state
-
-
-def check_surround_win(state: GameState) -> None:
-    """若某玩家无任何步行路径到目标，则该被围者直接获胜。"""
-    if state.winner is not None:
-        return
-    p0 = _has_path(state, 0)
-    p1 = _has_path(state, 1)
-    if not p0 and not p1:
-        # 双方皆无路：判当前行动方的对方获胜？简化判先手获胜并注明。
-        # 实际极罕见；选择让刚行动的人承担后果：turn 已切换，故 turn 方为受害对手…统一判 turn 方获胜更直观。
-        state.winner = state.turn
-        state.win_reason = "双方均被围死，轮到行动者获胜"
-    elif not p0:
-        state.winner = 0
-        state.win_reason = "对方被围死，被围者直接获胜"
-    elif not p1:
-        state.winner = 1
-        state.win_reason = "对方被围死，被围者直接获胜"
+    return _finish_event(state)
 
 
 def goal_cells(state: GameState) -> set[tuple[int, int]]:
@@ -665,5 +671,30 @@ def play_skill(
         del state.hands[player][skill]
     state.seq_skill_used = True
     state.history.append(entry)
-    return state
+    return _finish_event(state) if skill == "make_sand" else state
 
+
+
+def apply_event(state: GameState, decision: dict) -> GameState:
+    """AI 一次只提交一个事件；技能与动作一起成功或一起拒绝。"""
+    if not isinstance(decision, dict) or "actions" in decision:
+        raise ValueError("单事件协议须使用 action 对象，不接受 actions 数组")
+    skill = decision.get("skill")
+    action = decision.get("action")
+    if skill == "make_sand":
+        if "action" in decision:
+            raise ValueError("流沙须单独提交，随后收到新状态再行动")
+    elif not isinstance(action, dict):
+        raise ValueError("须提交一个 action 对象；只有流沙可单独使用")
+    probe = deepcopy(state)
+    if skill is not None:
+        play_skill(probe, skill, decision.get("to"))
+    if action is not None:
+        if action.get("type") == "move":
+            apply_pawn_move(probe, action["to"])
+        elif action.get("type") == "wall":
+            apply_wall(probe, Wall.from_dict(action["wall"]))
+        else:
+            raise ValueError("未知行动类型")
+    state.__dict__.update(probe.__dict__)
+    return state

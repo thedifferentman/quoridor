@@ -1,18 +1,9 @@
 // 示例 AI（C++，贪心策略）：从 stdin 读入 json，向 stdout 输出一行决策 json。
 // 规则解析与合法性复算见 ai_common.hpp（与后端 engine 完全一致，可直接照抄）。
 //
-// 两阶段协议（与 GET /api/games/{id}/export 的棋谱格式一致）：
-//   阶段一 选技能卡：输入 {"phase":"select","skill_k":k,...}，
-//                   输出 {"skills":[...]}（恰好 k 个，可重复）。
-//   阶段二 每轮行动：输入当前棋谱 json，输出：
-//     不用技能：{"type":"move","to":[r,c]}
-//               {"type":"wall","wall":{"wr":..,"wc":..,"orientation":"H"}}（直墙 H/V）
-//               {"type":"wall","wall":{"wr":..,"wc":..,"kind":"L","arm":"NW"}}（L 墙，需改造权）
-//     先用技能：{"skill":"double_move","action":{"type":"move","to":[r,c]}}
-//               {"skill":"phase_walk","action":{"type":"move","to":[r,c]}}
-//               {"skill":"free_wall","action":{"type":"wall","wall":{...}}}
-//               {"skill":"l_remodel","action":{"type":"wall","wall":{L 墙 ...}}}
-//               {"skill":"make_sand","to":[r,c],"action":{...}}（to 为流沙落点）
+// 单事件协议：普通技能加一个 action；流沙只输出 skill 和 to。
+// 连续行动的第二步由后端返回新状态后再次请求，不在 AI 中提前模拟。
+// 出题、选边、选技能仍由 phase 字段区分。
 //
 // 贪心策略：
 //   - 走子：BFS 算己方到获胜点的最短路，沿最短路走一步，严重回避流沙。
@@ -105,12 +96,13 @@ int main() {
         return 0;
     }
 
-    // ===== 阶段二：行动（一次输出覆盖整轮；连续行动须一次输出两步） =====
+    // ===== 阶段二：行动（每次只输出一个事件） =====
     Board b = parseBoard(j);
-    auto useSkill = [&](const std::string &s) { return b.hand.count(s) && b.hand[s] > 0; };
+    auto useSkill = [&](const std::string &s) { return !b.skill_used && b.hand.count(s) && b.hand[s] > 0; };
 
     auto blocked = buildBlocked(b, {}, b.phased);
     auto legal = stepNeighbors(b, b.me, b.me, b.opp, blocked);
+    legal.erase(std::remove_if(legal.begin(), legal.end(), [&](Cell to) { return !checkMove(b, to).ok; }), legal.end());
     if (legal.empty()) {  // 无路（几乎不可能）：认输式输出
         std::cout << "{\"type\":\"move\",\"to\":[" << b.me.first << "," << b.me.second << "]}";
         return 0;
@@ -132,9 +124,8 @@ int main() {
             }
         }
         if (target.first >= 0) {
-            Cell s = bestStep(b, distMe, legal);
             json to = json::array({target.first, target.second});
-            json out = decision("make_sand", to, {moveAct(s.first, s.second)});
+            json out = decision("make_sand", to);
             std::cout << checked(b, out, legal).dump();
             return 0;
         }
@@ -144,7 +135,7 @@ int main() {
     WallSpec bestWall;
     bool hasWall = false;
     int bestGain = 0;
-    bool canWall = (b.wallsLeft > 0 || b.freeWall);
+    bool canWall = !b.must_move && (b.wallsLeft > 0 || b.freeWall || useSkill("free_wall"));
     if (canWall && oppD < INF) {
         std::set<std::pair<Cell, Cell>> existing = buildBlocked(b, {}, false);
         std::vector<WallSpec> cands;
@@ -168,8 +159,9 @@ int main() {
             if (overlap) continue;
             auto nb = buildBlocked(b, {w}, false);
             auto dMe = bfsDist(b, b.turn, nb);
-            if (dMe[b.me.first][b.me.second] >= INF) continue;  // 己方不能断路（避免送围死胜）
+            if (dMe[b.me.first][b.me.second] >= INF) continue;  // 己方不能断路，围死犯规。
             auto dOpp = bfsDist(b, 1 - b.turn, nb);
+            if (dOpp[b.opp.first][b.opp.second] >= INF) continue;
             int gain = dOpp[b.opp.first][b.opp.second] - oppD;
             if (gain > bestGain) {
                 bestGain = gain;
@@ -179,42 +171,31 @@ int main() {
         }
     }
 
-    // --- 技能 2：连续行动（距目标远时，一次输出两步） ---
+    // 连续行动只决定第一步；第二步由新快照中的 must_move 约束。
     if (useSkill("double_move") && myD > 3 && myD < INF) {
-        Cell s1 = bestStep(b, distMe, legal);
-        Board b2 = b;
-        b2.me = s1;
-        auto legal2 = stepNeighbors(b2, b2.me, b2.me, b2.opp, buildBlocked(b2, {}, b2.phased));
-        Cell s2 = legal2.empty() ? s1 : bestStep(b2, distMe, legal2);
-        json out = decision("double_move", json(nullptr),
-                            {moveAct(s1.first, s1.second), moveAct(s2.first, s2.second)});
-        std::cout << checked(b, out, legal).dump();
+        Cell to = bestStep(b, distMe, legal);
+        std::cout << checked(b, decision("double_move", nullptr, moveAct(to.first, to.second)), legal).dump();
         return 0;
     }
     // --- 技能 3：穿墙（被墙严重绕路时，用无视墙视角走一步） ---
     if (useSkill("phase_walk") && myD > 6 && myD < INF) {
         auto distPhase = bfsDist(b, b.turn, {});
         auto legalPhase = stepNeighbors(b, b.me, b.me, b.opp, {});
+        Board phased = b; phased.phased = true;
+        legalPhase.erase(std::remove_if(legalPhase.begin(), legalPhase.end(), [&](Cell to) { return !checkMove(phased, to).ok; }), legalPhase.end());
         if (!legalPhase.empty()) {
             Cell s = bestStep(b, distPhase, legalPhase);
-            json out = decision("phase_walk", json(nullptr), {moveAct(s.first, s.second)});
+            json out = decision("phase_walk", json(nullptr), moveAct(s.first, s.second));
             std::cout << checked(b, out, legalPhase).dump();
             return 0;
         }
     }
     // --- 放墙（含免费墙） ---
-    if (hasWall && bestGain >= 2 && (b.freeWall || (rng()() % 100 < 30))) {
+    if (hasWall && bestGain >= 2 && (b.freeWall || useSkill("free_wall") || (rng()() % 100 < 30))) {
         json wj = wallJson(bestWall);
-        if (b.freeWall && useSkill("free_wall")) {
-            json out = decision("free_wall", json(nullptr), {wallAct(wj)});
-            std::cout << checked(b, out, legal).dump();
-            return 0;
-        }
-        if (!b.freeWall) {
-            json out = decision("", json(nullptr), {wallAct(wj)});
-            std::cout << checked(b, out, legal).dump();
-            return 0;
-        }
+        std::string skill = !b.freeWall && useSkill("free_wall") ? "free_wall" : "";
+        std::cout << checked(b, decision(skill, nullptr, wallAct(wj)), legal).dump();
+        return 0;
     }
     // L 墙机会：无直墙好位但有改造卡时，现打现放
     if (!hasWall && useSkill("l_remodel") && canWall) {
@@ -233,8 +214,9 @@ int main() {
                 }
             if (overlap) continue;
             auto nb = buildBlocked(b, {w}, false);
-            if (bfsDist(b, b.turn, nb)[b.me.first][b.me.second] >= INF) continue;
-            json out = decision("l_remodel", json(nullptr), {wallAct(wallJson(w))});
+            if (bfsDist(b, b.turn, nb)[b.me.first][b.me.second] >= INF ||
+                bfsDist(b, 1-b.turn, nb)[b.opp.first][b.opp.second] >= INF) continue;
+            json out = decision("l_remodel", json(nullptr), wallAct(wallJson(w)));
             std::cout << checked(b, out, legal).dump();
             return 0;
         }
@@ -242,7 +224,7 @@ int main() {
 
     // --- 默认：沿最短路走一步 ---
     Cell s = bestStep(b, distMe, legal);
-    json out = decision("", json(nullptr), {moveAct(s.first, s.second)});
+    json out = decision("", json(nullptr), moveAct(s.first, s.second));
     std::cout << checked(b, out, legal).dump();
     return 0;
 }
